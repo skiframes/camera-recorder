@@ -11,7 +11,7 @@
 
 # Load credentials from config file
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CREDENTIALS_FILE="${SCRIPT_DIR}/../credentials.local"
+CREDENTIALS_FILE="${SCRIPT_DIR}/credentials.local"
 
 if [[ ! -f "$CREDENTIALS_FILE" ]]; then
     echo "Error: credentials.local not found at $CREDENTIALS_FILE"
