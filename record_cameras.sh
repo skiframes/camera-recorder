@@ -73,13 +73,17 @@ start_one () {
 
   echo "Starting ${name} (GPU encoding @ ${fps}fps, $((bitrate/1000))kbps)..."
 
-  # splitmuxsink handles segmentation with proper timestamps
+  # Generate timestamp for this recording session
+  local timestamp=$(date +%Y%m%d_%H%M%S)
+  
+  # splitmuxsink uses %05d for segment number (00000, 00001, etc.)
+  # Format: cameraname_YYYYMMDD_HHMMSS_00000.mkv
   nohup gst-launch-1.0 -e \
     rtspsrc location="${url}" protocols=tcp latency=0 ! \
     rtph264depay ! h264parse ! nvv4l2decoder ! \
     nvv4l2h264enc bitrate=${bitrate} iframeinterval=${gop_size} ! \
     h264parse ! \
-    splitmuxsink location="${outdir}/${name}_%Y%m%d_%H%M%S.mkv" \
+    splitmuxsink location="${outdir}/${name}_${timestamp}_%05d.mkv" \
       max-size-time=$((SEGMENT_SECONDS * 1000000000)) \
       muxer=matroskamux \
     >> "$logfile" 2>&1 &
