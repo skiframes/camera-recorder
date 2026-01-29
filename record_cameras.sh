@@ -190,6 +190,56 @@ start_all () {
 }
 
 # =============================================================================
+# Daemon mode - monitor and restart crashed recordings
+# =============================================================================
+
+MONITOR_INTERVAL=30  # seconds between health checks
+
+monitor_and_restart() {
+  echo "Starting daemon mode - monitoring recordings..."
+  echo "Press Ctrl+C to stop"
+  
+  # Trap SIGTERM/SIGINT for graceful shutdown
+  trap 'echo "Shutting down..."; stop_all; exit 0' SIGTERM SIGINT
+  
+  # Initial start
+  start_all
+  
+  while true; do
+    sleep "$MONITOR_INTERVAL"
+    
+    # Check each camera from config
+    while IFS='|' read -r name url fps bitrate; do
+      [[ -z "${name// }" ]] && continue
+      [[ "$name" =~ ^# ]] && continue
+      [[ -z "${url// }" ]] && continue
+      
+      fps="${fps:-30}"
+      bitrate="${bitrate:-$DEFAULT_BITRATE}"
+      
+      local pidfile="/tmp/camera_${name}.pid"
+      local needs_restart=false
+      
+      if [[ -f "$pidfile" ]]; then
+        local pid=$(cat "$pidfile")
+        if ! kill -0 "$pid" 2>/dev/null; then
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${name} died (PID ${pid}), restarting..."
+          rm -f "$pidfile"
+          needs_restart=true
+        fi
+      else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${name} not running, starting..."
+        needs_restart=true
+      fi
+      
+      if [[ "$needs_restart" == "true" ]]; then
+        start_one "$name" "$url" "$fps" "$bitrate"
+      fi
+    done < "$CONF"
+  done
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -208,13 +258,17 @@ case "${1:-start}" in
   status)
     show_status
     ;;
+  daemon)
+    monitor_and_restart
+    ;;
   *)
-    echo "Usage: $0 {start|stop|restart|status}"
+    echo "Usage: $0 {start|stop|restart|status|daemon}"
     echo ""
     echo "  start   - Start recording all cameras in config"
     echo "  stop    - Stop all recordings gracefully"
     echo "  restart - Stop then start all recordings"
     echo "  status  - Show running recordings"
+    echo "  daemon  - Run in foreground, monitor and auto-restart crashed recordings"
     exit 1
     ;;
 esac
