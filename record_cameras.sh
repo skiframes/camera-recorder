@@ -2,12 +2,68 @@
 set -euo pipefail
 
 # =============================================================================
-# Camera Recording with Jetson GPU Hardware Encoding
+# Camera Recording with Hardware Encoding
 # Supports both Reolink and Axis cameras
-# Uses GStreamer + nvv4l2h264enc for ~20x less CPU than ffmpeg libx264
+# Auto-detects platform: Jetson (NVENC), x86 (VA-API/QSV), or software fallback
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# =============================================================================
+# Platform Detection
+# =============================================================================
+
+detect_platform() {
+  # Check for Jetson (NVIDIA Tegra)
+  if [[ -f /etc/nv_tegra_release ]] || [[ -d /sys/class/tegra* ]] 2>/dev/null; then
+    if gst-inspect-1.0 nvv4l2h264enc &>/dev/null; then
+      echo "jetson"
+      return
+    fi
+  fi
+
+  # Check for VA-API (Intel/AMD)
+  if gst-inspect-1.0 vaapih264enc &>/dev/null; then
+    # Verify VA-API actually works (has a valid device)
+    if vainfo &>/dev/null 2>&1; then
+      echo "vaapi"
+      return
+    fi
+  fi
+
+  # Fallback to software encoding
+  if gst-inspect-1.0 x264enc &>/dev/null; then
+    echo "software"
+    return
+  fi
+
+  echo "none"
+}
+
+PLATFORM="${ENCODER_PLATFORM:-$(detect_platform)}"
+
+case "$PLATFORM" in
+  jetson)
+    PLATFORM_DESC="Jetson NVENC"
+    MONITOR_CMD="tegrastats"
+    ;;
+  vaapi)
+    PLATFORM_DESC="VA-API (Intel/AMD)"
+    MONITOR_CMD="intel_gpu_top"
+    ;;
+  software)
+    PLATFORM_DESC="Software x264 (high CPU)"
+    MONITOR_CMD="htop"
+    ;;
+  *)
+    echo "ERROR: No suitable encoder found."
+    echo "Install GStreamer plugins:"
+    echo "  Jetson: nvidia-l4t-gstreamer (usually pre-installed)"
+    echo "  Intel:  sudo apt install gstreamer1.0-vaapi intel-media-va-driver vainfo"
+    echo "  Fallback: sudo apt install gstreamer1.0-plugins-ugly"
+    exit 1
+    ;;
+esac
 
 # Load local credentials (not in git)
 CREDENTIALS_FILE="${SCRIPT_DIR}/credentials.local"
@@ -60,7 +116,7 @@ start_one () {
   local outdir="${BASE}/${name}"
   mkdir -p "$outdir"
 
-  local logfile="${LOGS}/${name}_gpu.log"
+  local logfile="${LOGS}/${name}.log"
   
   # Check if already running for this camera
   if pgrep -af "gst-launch" | grep -F -- "/${name}/" >/dev/null 2>&1; then
@@ -70,18 +126,36 @@ start_one () {
 
   # Calculate GOP size (1 second of frames)
   local gop_size="${fps}"
+  local bitrate_kbps=$((bitrate/1000))
 
-  echo "Starting ${name} (GPU encoding @ ${fps}fps, $((bitrate/1000))kbps)..."
+  echo "Starting ${name} (${PLATFORM_DESC} @ ${fps}fps, ${bitrate_kbps}kbps)..."
 
   # Generate timestamp for this recording session
   local timestamp=$(date +%Y%m%d_%H%M%S)
-  
+
+  # Build platform-specific encode pipeline
+  local encode_pipeline
+  case "$PLATFORM" in
+    jetson)
+      # NVIDIA Jetson hardware encoding
+      encode_pipeline="nvv4l2decoder ! nvv4l2h264enc bitrate=${bitrate} iframeinterval=${gop_size}"
+      ;;
+    vaapi)
+      # Intel/AMD VA-API hardware encoding
+      # Note: vaapi uses kbps for bitrate
+      encode_pipeline="vaapidecodebin ! vaapih264enc bitrate=${bitrate_kbps} keyframe-period=${gop_size}"
+      ;;
+    software)
+      # Software x264 encoding (high CPU usage)
+      encode_pipeline="avdec_h264 ! x264enc bitrate=${bitrate_kbps} key-int-max=${gop_size} speed-preset=superfast tune=zerolatency"
+      ;;
+  esac
+
   # splitmuxsink uses %05d for segment number (00000, 00001, etc.)
   # Format: cameraname_YYYYMMDD_HHMMSS_00000.mkv
   nohup gst-launch-1.0 -e \
     rtspsrc location="${url}" protocols=tcp latency=0 ! \
-    rtph264depay ! h264parse ! nvv4l2decoder ! \
-    nvv4l2h264enc bitrate=${bitrate} iframeinterval=${gop_size} ! \
+    rtph264depay ! h264parse ! ${encode_pipeline} ! \
     h264parse ! \
     splitmuxsink location="${outdir}/${name}_${timestamp}_%05d.mkv" \
       max-size-time=$((SEGMENT_SECONDS * 1000000000)) \
@@ -115,8 +189,8 @@ stop_one () {
 
 show_status () {
   echo ""
-  echo "Camera Recording Status"
-  echo "========================"
+  echo "Camera Recording Status (${PLATFORM_DESC})"
+  echo "============================================"
   
   for pidfile in /tmp/camera_*.pid; do
     [[ -f "$pidfile" ]] || continue
@@ -184,8 +258,8 @@ start_all () {
 
   sleep 2
   show_status
-  
-  echo "Monitor GPU usage with: tegrastats"
+
+  echo "Monitor with: ${MONITOR_CMD}"
   echo "Check logs in: ${LOGS}/"
 }
 
@@ -261,14 +335,22 @@ case "${1:-start}" in
   daemon)
     monitor_and_restart
     ;;
+  info)
+    echo "Platform: ${PLATFORM_DESC}"
+    echo "Encoder:  ${PLATFORM}"
+    echo "Monitor:  ${MONITOR_CMD}"
+    echo ""
+    echo "Override with: ENCODER_PLATFORM=jetson|vaapi|software $0 start"
+    ;;
   *)
-    echo "Usage: $0 {start|stop|restart|status|daemon}"
+    echo "Usage: $0 {start|stop|restart|status|daemon|info}"
     echo ""
     echo "  start   - Start recording all cameras in config"
     echo "  stop    - Stop all recordings gracefully"
     echo "  restart - Stop then start all recordings"
     echo "  status  - Show running recordings"
     echo "  daemon  - Run in foreground, monitor and auto-restart crashed recordings"
+    echo "  info    - Show detected platform and encoder"
     exit 1
     ;;
 esac

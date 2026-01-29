@@ -1,19 +1,47 @@
 # Camera Recorder
 
-GPU-accelerated multi-camera recording for Jetson devices using GStreamer and NVENC hardware encoding.
+Hardware-accelerated multi-camera recording using GStreamer with automatic platform detection.
 
 ## Features
 
-- **Hardware encoding** via Jetson NVENC - uses ~7% CPU per camera vs ~165% with software encoding
+- **Hardware encoding** - Auto-detects platform and uses the best available encoder
+- **Multi-platform** - Jetson (NVENC), Intel/AMD (VA-API), or software fallback
 - **Multi-camera support** - Reolink and Axis cameras
 - **Automatic segmentation** - 10-minute MKV files with timestamps
 - **Secure credentials** - Passwords stored locally, never committed to git
 
+## Supported Platforms
+
+| Platform | Encoder | CPU Usage | Notes |
+|----------|---------|-----------|-------|
+| NVIDIA Jetson | nvv4l2h264enc | ~7% | Tested on Jetson Nano/Xavier, Seeed J40 |
+| Intel x86 | vaapih264enc | ~10-15% | Requires `gstreamer1.0-vaapi` |
+| AMD x86 | vaapih264enc | ~10-15% | Requires `gstreamer1.0-vaapi` |
+| Any (fallback) | x264enc | ~165% | Software encoding, limits concurrent streams |
+
 ## Requirements
 
-- NVIDIA Jetson (tested on Jetson Nano/Xavier)
-- GStreamer with NVIDIA plugins (`nvv4l2decoder`, `nvv4l2h264enc`)
+- GStreamer 1.0 with appropriate plugins for your platform
 - Network-accessible IP cameras (Reolink, Axis, or other RTSP sources)
+
+### Platform-specific dependencies
+
+**Jetson (pre-installed on JetPack):**
+```bash
+# Usually already available
+gst-inspect-1.0 nvv4l2h264enc
+```
+
+**Ubuntu/Debian x86 (Intel/AMD VA-API):**
+```bash
+sudo apt install gstreamer1.0-vaapi intel-media-va-driver vainfo
+# Verify: vainfo
+```
+
+**Fallback (software):**
+```bash
+sudo apt install gstreamer1.0-plugins-ugly gstreamer1.0-libav
+```
 
 ## Setup
 
@@ -58,8 +86,10 @@ GPU-accelerated multi-camera recording for Jetson devices using GStreamer and NV
 # Watch CPU usage
 htop
 
-# Watch GPU/NVENC usage
-tegrastats
+# Watch GPU usage (platform-specific)
+tegrastats       # Jetson
+intel_gpu_top    # Intel (requires intel-gpu-tools)
+radeontop        # AMD
 
 # Check logs
 tail -f /home/paul/data/logs/*.log
@@ -101,12 +131,24 @@ Recordings are saved to `/home/paul/data/recordings/<camera_name>/`:
 
 ## CPU Comparison
 
-| Encoder | CPU per Stream |
-|---------|----------------|
-| ffmpeg libx264 | ~165% |
-| GStreamer nvv4l2h264enc | ~7% |
+| Encoder | CPU per Stream | Max Streams (4-core) |
+|---------|----------------|----------------------|
+| GStreamer nvv4l2h264enc (Jetson) | ~7% | 10+ |
+| GStreamer vaapih264enc (Intel) | ~10-15% | 6-8 |
+| GStreamer x264enc (software) | ~165% | 2 |
 
-This allows recording 4+ cameras simultaneously on a Jetson while leaving CPU headroom for other tasks like live streaming.
+Hardware encoding allows recording multiple cameras while leaving CPU headroom for other tasks.
+
+## Check Detected Platform
+
+```bash
+./record_cameras.sh info
+```
+
+Override auto-detection if needed:
+```bash
+ENCODER_PLATFORM=vaapi ./record_cameras.sh start
+```
 
 ## License
 
