@@ -9,6 +9,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Load local credentials FIRST (needed for ENCODER_PLATFORM override)
+CREDENTIALS_FILE="${SCRIPT_DIR}/credentials.local"
+if [[ -f "$CREDENTIALS_FILE" ]]; then
+  source "$CREDENTIALS_FILE"
+else
+  echo "ERROR: Missing credentials file: $CREDENTIALS_FILE"
+  echo ""
+  echo "Create it from the template:"
+  echo "  cp credentials.template credentials.local"
+  echo "  # Edit credentials.local with your passwords"
+  exit 1
+fi
+
 # =============================================================================
 # Platform Detection
 # =============================================================================
@@ -75,19 +88,6 @@ case "$PLATFORM" in
     exit 1
     ;;
 esac
-
-# Load local credentials (not in git)
-CREDENTIALS_FILE="${SCRIPT_DIR}/credentials.local"
-if [[ -f "$CREDENTIALS_FILE" ]]; then
-  source "$CREDENTIALS_FILE"
-else
-  echo "ERROR: Missing credentials file: $CREDENTIALS_FILE"
-  echo ""
-  echo "Create it from the template:"
-  echo "  cp credentials.template credentials.local"
-  echo "  # Edit credentials.local with your passwords"
-  exit 1
-fi
 
 # Config file (cameras defined here, credentials substituted at runtime)
 CONF="${SCRIPT_DIR}/cameras.conf"
