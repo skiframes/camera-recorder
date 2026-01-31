@@ -6,6 +6,7 @@ set -euo pipefail
 # Supports both Reolink and Axis cameras
 # Auto-detects platform: Jetson (NVENC), x86 (VA-API/QSV), or software fallback
 # Per-camera encoder override supported via 5th field in cameras.conf
+# Encoder options: jetson, vaapi, software (gst x264), ffmpeg (recommended)
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,7 +48,15 @@ detect_platform() {
     fi
   fi
 
-  # Fallback to software encoding
+  # Prefer FFmpeg software encoding (better quality for fast motion)
+  if command -v ffmpeg &>/dev/null; then
+    if ffmpeg -encoders 2>/dev/null | grep -q "libx264"; then
+      echo "ffmpeg"
+      return
+    fi
+  fi
+
+  # GStreamer software fallback
   if gst-inspect-1.0 x264enc &>/dev/null; then
     echo "software"
     return
@@ -67,6 +76,10 @@ check_encoder_available() {
     vaapi)
       GST_VAAPI_ALL_DRIVERS=1 gst-inspect-1.0 vaapih264enc &>/dev/null || return 1
       vainfo 2>/dev/null | grep -q "VAProfileH264.*VAEntrypointEncSlice" || return 1
+      ;;
+    ffmpeg)
+      command -v ffmpeg &>/dev/null || return 1
+      ffmpeg -encoders 2>/dev/null | grep -q "libx264" || return 1
       ;;
     software)
       gst-inspect-1.0 x264enc &>/dev/null || return 1
@@ -98,15 +111,20 @@ case "$PLATFORM" in
       MONITOR_CMD="htop"
     fi
     ;;
+  ffmpeg)
+    PLATFORM_DESC="FFmpeg libx264 (best motion quality)"
+    MONITOR_CMD="htop"
+    ;;
   software)
-    PLATFORM_DESC="Software x264 (high CPU)"
+    PLATFORM_DESC="GStreamer x264 (high CPU)"
     MONITOR_CMD="htop"
     ;;
   *)
     echo "ERROR: No suitable encoder found."
-    echo "Install GStreamer plugins:"
-    echo "  Jetson: nvidia-l4t-gstreamer (usually pre-installed)"
-    echo "  Intel:  sudo apt install gstreamer1.0-vaapi intel-media-va-driver vainfo"
+    echo "Install one of:"
+    echo "  FFmpeg:  sudo apt install ffmpeg (recommended for quality)"
+    echo "  Jetson:  nvidia-l4t-gstreamer (usually pre-installed)"
+    echo "  Intel:   sudo apt install gstreamer1.0-vaapi intel-media-va-driver vainfo"
     echo "  Fallback: sudo apt install gstreamer1.0-plugins-ugly"
     exit 1
     ;;
@@ -122,8 +140,6 @@ SEGMENT_SECONDS=600     # 10 minutes
 # Hardware encoder settings (bitrate in bits/sec)
 DEFAULT_BITRATE=8000000      # 8Mbps for 30fps
 HIGH_BITRATE=12000000        # 12Mbps for 60fps
-
-mkdir -p "$BASE" "$LOGS"
 
 # Substitute credentials in URL
 expand_url() {
@@ -153,8 +169,8 @@ start_one () {
 
   local logfile="${LOGS}/${name}.log"
 
-  # Check if already running for this camera
-  if pgrep -af "gst-launch" | grep -F -- "/${name}/" >/dev/null 2>&1; then
+  # Check if already running for this camera (check both gst-launch and ffmpeg)
+  if pgrep -af "gst-launch|ffmpeg" | grep -F -- "/${name}/" >/dev/null 2>&1; then
     echo "Already running: ${name}"
     return 0
   fi
@@ -165,13 +181,14 @@ start_one () {
 
   if [[ -n "$encoder_override" ]]; then
     case "$encoder_override" in
-      jetson|vaapi|software)
+      jetson|vaapi|ffmpeg|software)
         if check_encoder_available "$encoder_override"; then
           effective_encoder="$encoder_override"
           case "$encoder_override" in
             jetson)   encoder_desc="Jetson NVENC (override)" ;;
             vaapi)    encoder_desc="VA-API (override)" ;;
-            software) encoder_desc="Software x264 (override)" ;;
+            ffmpeg)   encoder_desc="FFmpeg libx264 (override)" ;;
+            software) encoder_desc="GStreamer x264 (override)" ;;
           esac
         else
           echo "  WARNING: Encoder '${encoder_override}' not available for ${name}, falling back to ${PLATFORM_DESC}"
@@ -194,41 +211,74 @@ start_one () {
   # Generate timestamp for this recording session
   local timestamp=$(date +%Y%m%d_%H%M%S)
 
-  # Build encoder-specific encode pipeline
-  # Motion-optimized settings: no B-frames, shorter GOP, VBR rate control
-  # These settings prioritize quality for fast-moving objects (sports, etc.)
-  local encode_pipeline
-  case "$effective_encoder" in
-    jetson)
-      # NVIDIA Jetson hardware encoding
-      # maxperf-enable: max quality mode, num-B-Frames=0: disable B-frames for motion
-      encode_pipeline="nvv4l2decoder ! nvv4l2h264enc bitrate=${bitrate} iframeinterval=${gop_size} maxperf-enable=true num-B-Frames=0"
-      ;;
-    vaapi)
-      # Intel/AMD VA-API hardware encoding
-      # Note: vaapi uses kbps for bitrate
-      # max-bframes=0: disable B-frames (critical for fast motion)
-      # rate-control=vbr: variable bitrate allows more bits for complex motion
-      # quality-level=2: higher quality (1=best, 7=fastest)
-      encode_pipeline="vaapidecodebin ! vaapih264enc bitrate=${bitrate_kbps} keyframe-period=${gop_size} max-bframes=0 rate-control=vbr quality-level=2"
-      ;;
-    software)
-      # Software x264 encoding (high CPU usage)
-      # bframes=0: disable B-frames for motion, ref=4: more reference frames
-      encode_pipeline="avdec_h264 ! x264enc bitrate=${bitrate_kbps} key-int-max=${gop_size} bframes=0 ref=4 speed-preset=superfast"
-      ;;
-  esac
+  # FFmpeg encoder uses a completely different pipeline
+  if [[ "$effective_encoder" == "ffmpeg" ]]; then
+    # FFmpeg with libx264 - best quality for fast motion
+    # -preset medium: good balance of quality and speed (slower = better quality)
+    # -tune film: optimized for high-quality video content
+    # -crf 18: high quality (lower = better, 18 is visually lossless)
+    # -maxrate/bufsize: constrain to target bitrate for consistent file sizes
+    # -g: GOP size (keyframe interval)
+    # -bf 0: no B-frames (better for fast motion)
+    # -refs 4: more reference frames for better motion prediction
+    # -segment_time: split into segments
+    nohup ffmpeg -hide_banner -y \
+      -rtsp_transport tcp \
+      -i "${url}" \
+      -c:v libx264 \
+      -preset medium \
+      -tune film \
+      -crf 18 \
+      -maxrate "${bitrate_kbps}k" \
+      -bufsize "$((bitrate_kbps * 2))k" \
+      -g "${gop_size}" \
+      -bf 0 \
+      -refs 4 \
+      -c:a aac -b:a 128k \
+      -f segment \
+      -segment_time "${SEGMENT_SECONDS}" \
+      -segment_format matroska \
+      -reset_timestamps 1 \
+      -strftime 1 \
+      "${outdir}/${name}_%Y%m%d_%H%M%S.mkv" \
+      >> "$logfile" 2>&1 &
+  else
+    # GStreamer-based encoders (jetson, vaapi, software)
+    # Build encoder-specific encode pipeline
+    # Motion-optimized settings: no B-frames, shorter GOP, VBR rate control
+    local encode_pipeline
+    case "$effective_encoder" in
+      jetson)
+        # NVIDIA Jetson hardware encoding
+        # maxperf-enable: max quality mode, num-B-Frames=0: disable B-frames for motion
+        encode_pipeline="nvv4l2decoder ! nvv4l2h264enc bitrate=${bitrate} iframeinterval=${gop_size} maxperf-enable=true num-B-Frames=0"
+        ;;
+      vaapi)
+        # Intel/AMD VA-API hardware encoding
+        # Note: vaapi uses kbps for bitrate
+        # max-bframes=0: disable B-frames (critical for fast motion)
+        # rate-control=vbr: variable bitrate allows more bits for complex motion
+        # quality-level=2: higher quality (1=best, 7=fastest)
+        encode_pipeline="vaapidecodebin ! vaapih264enc bitrate=${bitrate_kbps} keyframe-period=${gop_size} max-bframes=0 rate-control=vbr quality-level=2"
+        ;;
+      software)
+        # GStreamer x264 encoding (high CPU usage)
+        # bframes=0: disable B-frames for motion, ref=4: more reference frames
+        encode_pipeline="avdec_h264 ! x264enc bitrate=${bitrate_kbps} key-int-max=${gop_size} bframes=0 ref=4 speed-preset=superfast"
+        ;;
+    esac
 
-  # splitmuxsink uses %05d for segment number (00000, 00001, etc.)
-  # Format: cameraname_YYYYMMDD_HHMMSS_00000.mkv
-  nohup gst-launch-1.0 -e \
-    rtspsrc location="${url}" protocols=tcp latency=0 ! \
-    rtph264depay ! h264parse ! ${encode_pipeline} ! \
-    h264parse ! \
-    splitmuxsink location="${outdir}/${name}_${timestamp}_%05d.mkv" \
-      max-size-time=$((SEGMENT_SECONDS * 1000000000)) \
-      muxer=matroskamux \
-    >> "$logfile" 2>&1 &
+    # splitmuxsink uses %05d for segment number (00000, 00001, etc.)
+    # Format: cameraname_YYYYMMDD_HHMMSS_00000.mkv
+    nohup gst-launch-1.0 -e \
+      rtspsrc location="${url}" protocols=tcp latency=0 ! \
+      rtph264depay ! h264parse ! ${encode_pipeline} ! \
+      h264parse ! \
+      splitmuxsink location="${outdir}/${name}_${timestamp}_%05d.mkv" \
+        max-size-time=$((SEGMENT_SECONDS * 1000000000)) \
+        muxer=matroskamux \
+      >> "$logfile" 2>&1 &
+  fi
 
   local pid=$!
   echo "  PID: ${pid}"
@@ -273,43 +323,49 @@ show_status () {
   done
   
   echo ""
-  echo "GStreamer processes:"
-  pgrep -af "gst-launch.*recordings" || echo "  (none)"
+  echo "Recording processes:"
+  pgrep -af "gst-launch.*recordings|ffmpeg.*recordings" || echo "  (none)"
   echo ""
 }
 
 stop_all () {
   echo "Stopping all camera recordings..."
-  
-  # Graceful shutdown
+
+  # Graceful shutdown (both gst-launch and ffmpeg)
   pkill -INT -f "gst-launch.*recordings" 2>/dev/null || true
+  pkill -INT -f "ffmpeg.*recordings" 2>/dev/null || true
   sleep 2
-  
+
   # Force if needed
-  if pgrep -af "gst-launch.*recordings" >/dev/null 2>&1; then
+  if pgrep -af "gst-launch.*recordings|ffmpeg.*recordings" >/dev/null 2>&1; then
     pkill -TERM -f "gst-launch.*recordings" 2>/dev/null || true
+    pkill -TERM -f "ffmpeg.*recordings" 2>/dev/null || true
     sleep 2
   fi
 
-  if pgrep -af "gst-launch.*recordings" >/dev/null 2>&1; then
+  if pgrep -af "gst-launch.*recordings|ffmpeg.*recordings" >/dev/null 2>&1; then
     pkill -9 -f "gst-launch.*recordings" 2>/dev/null || true
+    pkill -9 -f "ffmpeg.*recordings" 2>/dev/null || true
   fi
-  
+
   # Clean up PID files
   rm -f /tmp/camera_*.pid
-  
+
   echo "All recordings stopped."
 }
 
 start_all () {
+  # Create output directories
+  mkdir -p "$BASE" "$LOGS"
+
   if [[ ! -f "$CONF" ]]; then
     echo "ERROR: Config file not found: $CONF"
     echo ""
     echo "Create it with format:"
     echo "  name|rtsp_url|fps|bitrate|encoder"
     echo ""
-    echo "The encoder field is optional (jetson, vaapi, software)."
-    echo "If omitted, uses auto-detected platform encoder."
+    echo "The encoder field is optional (jetson, vaapi, ffmpeg, software)."
+    echo "If omitted, uses auto-detected encoder (prefers ffmpeg for quality)."
     exit 1
   fi
 
@@ -411,11 +467,17 @@ case "${1:-start}" in
     echo "Encoder:  ${PLATFORM}"
     echo "Monitor:  ${MONITOR_CMD}"
     echo ""
-    echo "Global override: ENCODER_PLATFORM=jetson|vaapi|software $0 start"
+    echo "Global override: ENCODER_PLATFORM=jetson|vaapi|ffmpeg|software $0 start"
     echo ""
     echo "Per-camera override: Add 5th field to cameras.conf"
     echo "  Format: name|url|fps|bitrate|encoder"
-    echo "  Valid encoders: jetson, vaapi, software"
+    echo "  Valid encoders: jetson, vaapi, ffmpeg, software"
+    echo ""
+    echo "Encoder notes:"
+    echo "  ffmpeg   - Best quality for fast motion (recommended)"
+    echo "  jetson   - NVIDIA Jetson hardware encoding"
+    echo "  vaapi    - Intel/AMD hardware encoding"
+    echo "  software - GStreamer x264 (fallback)"
     ;;
   *)
     echo "Usage: $0 {start|stop|restart|status|daemon|info}"
@@ -428,8 +490,8 @@ case "${1:-start}" in
     echo "  info    - Show detected platform and encoder info"
     echo ""
     echo "Config format: name|rtsp_url|fps|bitrate|encoder"
-    echo "  The encoder field is optional (jetson, vaapi, software)."
-    echo "  If omitted, uses auto-detected platform encoder."
+    echo "  The encoder field is optional (jetson, vaapi, ffmpeg, software)."
+    echo "  If omitted, uses auto-detected encoder (prefers ffmpeg for quality)."
     exit 1
     ;;
 esac
