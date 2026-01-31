@@ -183,8 +183,10 @@ start_one () {
     esac
   fi
 
-  # Calculate GOP size (1 second of frames)
-  local gop_size="${fps}"
+  # Calculate GOP size (0.5 seconds of frames for better fast-motion handling)
+  # Shorter GOP = more keyframes = better quality for sports/action but slightly larger files
+  local gop_size=$((fps / 2))
+  [[ $gop_size -lt 1 ]] && gop_size=1  # Minimum 1 frame
   local bitrate_kbps=$((bitrate/1000))
 
   echo "Starting ${name} (${encoder_desc} @ ${fps}fps, ${bitrate_kbps}kbps)..."
@@ -193,20 +195,27 @@ start_one () {
   local timestamp=$(date +%Y%m%d_%H%M%S)
 
   # Build encoder-specific encode pipeline
+  # Motion-optimized settings: no B-frames, shorter GOP, VBR rate control
+  # These settings prioritize quality for fast-moving objects (sports, etc.)
   local encode_pipeline
   case "$effective_encoder" in
     jetson)
       # NVIDIA Jetson hardware encoding
-      encode_pipeline="nvv4l2decoder ! nvv4l2h264enc bitrate=${bitrate} iframeinterval=${gop_size}"
+      # maxperf-enable: max quality mode, num-B-Frames=0: disable B-frames for motion
+      encode_pipeline="nvv4l2decoder ! nvv4l2h264enc bitrate=${bitrate} iframeinterval=${gop_size} maxperf-enable=true num-B-Frames=0"
       ;;
     vaapi)
       # Intel/AMD VA-API hardware encoding
       # Note: vaapi uses kbps for bitrate
-      encode_pipeline="vaapidecodebin ! vaapih264enc bitrate=${bitrate_kbps} keyframe-period=${gop_size}"
+      # max-bframes=0: disable B-frames (critical for fast motion)
+      # rate-control=vbr: variable bitrate allows more bits for complex motion
+      # quality-level=2: higher quality (1=best, 7=fastest)
+      encode_pipeline="vaapidecodebin ! vaapih264enc bitrate=${bitrate_kbps} keyframe-period=${gop_size} max-bframes=0 rate-control=vbr quality-level=2"
       ;;
     software)
       # Software x264 encoding (high CPU usage)
-      encode_pipeline="avdec_h264 ! x264enc bitrate=${bitrate_kbps} key-int-max=${gop_size} speed-preset=superfast tune=zerolatency"
+      # bframes=0: disable B-frames for motion, ref=4: more reference frames
+      encode_pipeline="avdec_h264 ! x264enc bitrate=${bitrate_kbps} key-int-max=${gop_size} bframes=0 ref=4 speed-preset=superfast"
       ;;
   esac
 
