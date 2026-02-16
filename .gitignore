@@ -1,0 +1,21 @@
+# Local credentials - NEVER commit these!
+credentials.local
+*.local
+
+# Logs and recordings
+*.log
+*.mkv
+*.mp4
+
+# PID files
+*.pid
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
