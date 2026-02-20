@@ -46,6 +46,11 @@ ADAPTIVE_RAISE_THRESHOLD=120 # % of target bitrate that allows upgrade
 LIVE_CONFIG_URL="https://media.skiframes.com/config/live-banner.json"
 LIVE_CHECK_INTERVAL=60  # seconds between live status checks
 
+# Stream config - camera source selection from admin page
+STREAM_CONFIG_URL="https://media.skiframes.com/config/stream-config.json"
+STREAM_CONFIG_CHECK_INTERVAL=30  # seconds between config checks
+CURRENT_STREAM_CONFIG_HASH=""
+
 # Bandwidth test server (uses Cloudflare's speed test)
 SPEEDTEST_UPLOAD_URL="https://speed.cloudflare.com/__up"
 SPEEDTEST_SIZE=1000000  # 1MB test file (reduced for lower data usage)
@@ -105,6 +110,114 @@ wait_for_live_enabled() {
         echo -e "${BLUE}[$timestamp]${NC} Live still disabled, waiting..."
         sleep "$LIVE_CHECK_INTERVAL"
     done
+}
+
+# =============================================================================
+# STREAM CONFIG (camera source from admin page)
+# =============================================================================
+
+get_camera_rtsp_url() {
+    local camera_name=$1
+    local stream_path=${2:-"h264Preview_01_main"}
+
+    case "$camera_name" in
+        axis|Axis)
+            echo "rtsp://${AXIS_USER:-$CAMERA_USER}:${AXIS_PASS:-$CAMERA_PASS}@192.168.0.100/axis-media/media.amp?profile=h264-60fps"
+            ;;
+        R1)
+            echo "rtsp://${CAMERA_USER}:${CAMERA_PASS}@192.168.0.101:554/${stream_path}"
+            ;;
+        R2)
+            echo "rtsp://${CAMERA_USER}:${CAMERA_PASS}@192.168.0.102:554/${stream_path}"
+            ;;
+        R3)
+            echo "rtsp://${CAMERA_USER}:${CAMERA_PASS}@192.168.0.103:554/${stream_path}"
+            ;;
+        *)
+            # Treat as raw IP for backward compatibility
+            echo "rtsp://${CAMERA_USER}:${CAMERA_PASS}@${camera_name}:554/${stream_path}"
+            ;;
+    esac
+}
+
+# Fetch and parse stream config from S3 using Python3
+# Returns: mode|camera|left_camera|left_crop|left_label|right_camera|right_crop|right_label
+fetch_stream_config() {
+    local config
+    config=$(curl -s --max-time 10 "${STREAM_CONFIG_URL}?t=$(date +%s)" 2>/dev/null)
+
+    if [[ -z "$config" || "$config" == *"NoSuchKey"* || "$config" == *"AccessDenied"* ]]; then
+        echo "single|R1||||||"
+        return
+    fi
+
+    python3 -c "
+import json, sys
+try:
+    c = json.loads('''${config}''')
+    m = c.get('mode', 'single')
+    cam = c.get('camera', 'R1')
+    s = c.get('split') or {}
+    l = s.get('left') or {}
+    r = s.get('right') or {}
+    print(f\"{m}|{cam}|{l.get('camera','')}|{l.get('crop','')}|{l.get('label','')}|{r.get('camera','')}|{r.get('crop','')}|{r.get('label','')}\")
+except:
+    print('single|R1||||||')
+" 2>/dev/null || echo "single|R1||||||"
+}
+
+# Check if stream config has changed (returns 0 if changed)
+has_stream_config_changed() {
+    local new_hash
+    new_hash=$(curl -s --max-time 5 "${STREAM_CONFIG_URL}?t=$(date +%s)" 2>/dev/null | md5sum | cut -d' ' -f1)
+
+    if [[ -n "$new_hash" && "$new_hash" != "$CURRENT_STREAM_CONFIG_HASH" ]]; then
+        CURRENT_STREAM_CONFIG_HASH="$new_hash"
+        return 0  # changed
+    fi
+    return 1  # not changed
+}
+
+# Build ffmpeg filter_complex for split view
+# Args: left_crop right_crop left_label right_label
+build_split_filter() {
+    local left_crop=$1
+    local right_crop=$2
+    local left_label=$3
+    local right_label=$4
+
+    local left_crop_filter=""
+    case "$left_crop" in
+        left)  left_crop_filter="crop=iw/2:ih:0:0" ;;
+        right) left_crop_filter="crop=iw/2:ih:iw/2:0" ;;
+        full)  left_crop_filter="scale=960:1080" ;;
+        *)     left_crop_filter="crop=iw/2:ih:iw/2:0" ;;
+    esac
+
+    local right_crop_filter=""
+    case "$right_crop" in
+        left)  right_crop_filter="crop=iw/2:ih:0:0" ;;
+        right) right_crop_filter="crop=iw/2:ih:iw/2:0" ;;
+        full)  right_crop_filter="scale=960:1080" ;;
+        *)     right_crop_filter="crop=iw/2:ih:iw/2:0" ;;
+    esac
+
+    local filter=""
+    filter+="[0:v]${left_crop_filter},scale=960:1080[left];"
+    filter+="[1:v]${right_crop_filter},scale=960:1080[right];"
+    filter+="[left][right]hstack=inputs=2[combined]"
+
+    if [[ -n "$left_label" && -n "$right_label" ]]; then
+        filter+=";[combined]drawtext=text='${left_label}':x=(w/4)-(tw/2):y=30:fontsize=36:fontcolor=white:borderw=2:bordercolor=black,drawtext=text='${right_label}':x=(3*w/4)-(tw/2):y=30:fontsize=36:fontcolor=white:borderw=2:bordercolor=black[out]"
+    elif [[ -n "$left_label" ]]; then
+        filter+=";[combined]drawtext=text='${left_label}':x=(w/4)-(tw/2):y=30:fontsize=36:fontcolor=white:borderw=2:bordercolor=black[out]"
+    elif [[ -n "$right_label" ]]; then
+        filter+=";[combined]drawtext=text='${right_label}':x=(3*w/4)-(tw/2):y=30:fontsize=36:fontcolor=white:borderw=2:bordercolor=black[out]"
+    else
+        filter+=";[combined]null[out]"
+    fi
+
+    echo "$filter"
 }
 
 # =============================================================================
@@ -363,6 +476,33 @@ adaptive_stream() {
         echo -e "${GREEN}Live is enabled - starting stream...${NC}"
         echo ""
 
+        # Fetch stream config from admin page
+        echo -e "${YELLOW}Fetching stream configuration...${NC}"
+        local stream_config=$(fetch_stream_config)
+        CURRENT_STREAM_CONFIG_HASH=$(curl -s --max-time 5 "${STREAM_CONFIG_URL}?t=$(date +%s)" 2>/dev/null | md5sum | cut -d' ' -f1)
+
+        local stream_mode=$(echo "$stream_config" | cut -d'|' -f1)
+        local stream_camera=$(echo "$stream_config" | cut -d'|' -f2)
+        local split_left_camera=$(echo "$stream_config" | cut -d'|' -f3)
+        local split_left_crop=$(echo "$stream_config" | cut -d'|' -f4)
+        local split_left_label=$(echo "$stream_config" | cut -d'|' -f5)
+        local split_right_camera=$(echo "$stream_config" | cut -d'|' -f6)
+        local split_right_crop=$(echo "$stream_config" | cut -d'|' -f7)
+        local split_right_label=$(echo "$stream_config" | cut -d'|' -f8)
+
+        if [[ "$stream_mode" == "split" ]]; then
+            echo -e "${CYAN}Stream mode: SPLIT VIEW${NC}"
+            echo -e "  Left:  ${split_left_camera} (crop: ${split_left_crop}) - ${split_left_label}"
+            echo -e "  Right: ${split_right_camera} (crop: ${split_right_crop}) - ${split_right_label}"
+        else
+            echo -e "${CYAN}Stream mode: SINGLE CAMERA - ${stream_camera}${NC}"
+            # Override CAMERA_IP with configured camera
+            if [[ -n "$stream_camera" && "$stream_camera" != "R1" ]]; then
+                echo -e "  Using camera from config: ${stream_camera}"
+            fi
+        fi
+        echo ""
+
         # Initial bandwidth test
         echo -e "${YELLOW}Running initial bandwidth test to determine starting quality...${NC}"
         local initial_speed=$(run_bandwidth_test 2000000 true)
@@ -386,34 +526,64 @@ adaptive_stream() {
         # Quality adaptation loop
         while [[ "$live_disabled" == "false" ]]; do
             echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-            echo -e "${BOLD}Starting stream at ${CYAN}${current_preset}${NC} quality${NC}"
+            echo -e "${BOLD}Starting stream at ${CYAN}${current_preset}${NC} quality (${stream_mode} mode)${NC}"
             echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
             # Set quality preset
             set_quality_preset "$current_preset"
 
-            # Build RTSP URL
-            local rtsp_url="rtsp://${CAMERA_USER}:${CAMERA_PASS}@${CAMERA_IP}:554/${STREAM_PATH}"
+            if [[ "$stream_mode" == "split" ]]; then
+                # SPLIT VIEW: two RTSP inputs with filter_complex
+                local left_url=$(get_camera_rtsp_url "$split_left_camera" "$STREAM_PATH")
+                local right_url=$(get_camera_rtsp_url "$split_right_camera" "$STREAM_PATH")
+                local filter=$(build_split_filter "$split_left_crop" "$split_right_crop" "$split_left_label" "$split_right_label")
 
-            # Start ffmpeg in background
-            ffmpeg -rtsp_transport tcp \
-                -fflags +genpts+igndts \
-                -use_wallclock_as_timestamps 1 \
-                -i "$rtsp_url" \
-                -f lavfi -i anullsrc=channel_layout=mono:sample_rate=48000 \
-                -c:v libx264 -preset $PRESET \
-                -profile:v $PROFILE -level $LEVEL \
-                -pix_fmt yuv420p \
-                -x264-params "keyint=${KEYINT}:min-keyint=${KEYINT}" \
-                -b:v $VIDEO_BITRATE -maxrate $MAX_BITRATE -bufsize $BUFFER_SIZE \
-                -vsync cfr \
-                -r $FRAME_RATE \
-                $SCALE \
-                -c:a aac -b:a $AUDIO_BITRATE \
-                -map 0:v:0 -map 1:a:0 \
-                -shortest \
-                -f flv \
-                "$RTMP_URL" 2>&1 &
+                echo -e "  Left:  ${split_left_camera} → ${left_url%%@*}@..."
+                echo -e "  Right: ${split_right_camera} → ${right_url%%@*}@..."
+                echo -e "  Filter: ${filter:0:80}..."
+
+                ffmpeg -rtsp_transport tcp -fflags +genpts+igndts -use_wallclock_as_timestamps 1 \
+                    -i "$left_url" \
+                    -rtsp_transport tcp -fflags +genpts+igndts -use_wallclock_as_timestamps 1 \
+                    -i "$right_url" \
+                    -f lavfi -i anullsrc=channel_layout=mono:sample_rate=48000 \
+                    -filter_complex "$filter" \
+                    -map "[out]" -map 2:a:0 \
+                    -c:v libx264 -preset $PRESET \
+                    -profile:v $PROFILE -level $LEVEL \
+                    -pix_fmt yuv420p \
+                    -x264-params "keyint=${KEYINT}:min-keyint=${KEYINT}" \
+                    -b:v $VIDEO_BITRATE -maxrate $MAX_BITRATE -bufsize $BUFFER_SIZE \
+                    -vsync cfr \
+                    -r $FRAME_RATE \
+                    -c:a aac -b:a $AUDIO_BITRATE \
+                    -shortest \
+                    -f flv \
+                    "$RTMP_URL" 2>&1 &
+            else
+                # SINGLE CAMERA
+                local rtsp_url=$(get_camera_rtsp_url "$stream_camera" "$STREAM_PATH")
+                echo -e "  Camera: ${stream_camera} → ${rtsp_url%%@*}@..."
+
+                ffmpeg -rtsp_transport tcp \
+                    -fflags +genpts+igndts \
+                    -use_wallclock_as_timestamps 1 \
+                    -i "$rtsp_url" \
+                    -f lavfi -i anullsrc=channel_layout=mono:sample_rate=48000 \
+                    -c:v libx264 -preset $PRESET \
+                    -profile:v $PROFILE -level $LEVEL \
+                    -pix_fmt yuv420p \
+                    -x264-params "keyint=${KEYINT}:min-keyint=${KEYINT}" \
+                    -b:v $VIDEO_BITRATE -maxrate $MAX_BITRATE -bufsize $BUFFER_SIZE \
+                    -vsync cfr \
+                    -r $FRAME_RATE \
+                    $SCALE \
+                    -c:a aac -b:a $AUDIO_BITRATE \
+                    -map 0:v:0 -map 1:a:0 \
+                    -shortest \
+                    -f flv \
+                    "$RTMP_URL" 2>&1 &
+            fi
 
             local ffmpeg_pid=$!
             echo -e "${GREEN}Stream started (PID: $ffmpeg_pid)${NC}"
@@ -423,10 +593,12 @@ adaptive_stream() {
             local check_count=0
             local consecutive_low=0
             local consecutive_high=0
+            local config_check_counter=0
 
             while kill -0 $ffmpeg_pid 2>/dev/null; do
                 sleep $ADAPTIVE_CHECK_INTERVAL
                 ((check_count++))
+                ((config_check_counter += ADAPTIVE_CHECK_INTERVAL))
 
                 # Check if live is still enabled
                 if ! check_live_enabled; then
@@ -434,47 +606,76 @@ adaptive_stream() {
                     echo -e "${RED}⚠ Live streaming DISABLED on skiframes.com${NC}"
                     echo -e "${YELLOW}Stopping stream to save data...${NC}"
 
-                    # Kill current stream
                     kill $ffmpeg_pid 2>/dev/null
                     wait $ffmpeg_pid 2>/dev/null
 
                     live_disabled=true
-                    break  # Break monitor loop
+                    break
+                fi
+
+                # Check if stream config has changed (every STREAM_CONFIG_CHECK_INTERVAL)
+                if (( config_check_counter >= STREAM_CONFIG_CHECK_INTERVAL )); then
+                    config_check_counter=0
+                    if has_stream_config_changed; then
+                        echo ""
+                        echo -e "${CYAN}⚡ Stream config changed! Restarting with new settings...${NC}"
+
+                        kill $ffmpeg_pid 2>/dev/null
+                        wait $ffmpeg_pid 2>/dev/null
+
+                        # Re-fetch config
+                        stream_config=$(fetch_stream_config)
+                        stream_mode=$(echo "$stream_config" | cut -d'|' -f1)
+                        stream_camera=$(echo "$stream_config" | cut -d'|' -f2)
+                        split_left_camera=$(echo "$stream_config" | cut -d'|' -f3)
+                        split_left_crop=$(echo "$stream_config" | cut -d'|' -f4)
+                        split_left_label=$(echo "$stream_config" | cut -d'|' -f5)
+                        split_right_camera=$(echo "$stream_config" | cut -d'|' -f6)
+                        split_right_crop=$(echo "$stream_config" | cut -d'|' -f7)
+                        split_right_label=$(echo "$stream_config" | cut -d'|' -f8)
+
+                        if [[ "$stream_mode" == "split" ]]; then
+                            echo -e "  New: SPLIT ${split_left_camera} + ${split_right_camera}"
+                        else
+                            echo -e "  New: SINGLE ${stream_camera}"
+                        fi
+
+                        sleep 2
+                        break  # Restart with new config
+                    fi
                 fi
 
                 # Quick bandwidth check
                 local current_speed=$(quick_bandwidth_check)
             local target_speed=${PRESET_BITRATE[$current_preset]}
             local ratio=0
-            
+
             if (( target_speed > 0 )); then
                 ratio=$(( (current_speed * 100) / target_speed ))
             fi
-            
+
             local timestamp=$(date '+%H:%M:%S')
             echo -e "${BLUE}[$timestamp]${NC} Bandwidth: ${current_speed} Kbps | Target: ${target_speed} Kbps | Ratio: ${ratio}%"
-            
+
             # Check if we need to adjust quality
             if (( ratio < ADAPTIVE_DROP_THRESHOLD )); then
                 ((consecutive_low++))
                 consecutive_high=0
-                
+
                 if (( consecutive_low >= 2 )); then
-                    # Need to drop quality
                     local current_index=$(get_preset_index "$current_preset")
                     if (( current_index > 0 )); then
                         local new_preset="${PRESET_ORDER[$((current_index - 1))]}"
                         echo ""
                         echo -e "${RED}⚠ Bandwidth too low! Dropping from ${current_preset} to ${new_preset}${NC}"
-                        
-                        # Kill current stream
+
                         kill $ffmpeg_pid 2>/dev/null
                         wait $ffmpeg_pid 2>/dev/null
-                        
+
                         current_preset=$new_preset
                         consecutive_low=0
                         sleep 2
-                        break  # Restart with new quality
+                        break
                     else
                         echo -e "${RED}  Already at lowest quality${NC}"
                     fi
@@ -482,23 +683,21 @@ adaptive_stream() {
             elif (( ratio > ADAPTIVE_RAISE_THRESHOLD )); then
                 ((consecutive_high++))
                 consecutive_low=0
-                
+
                 if (( consecutive_high >= 4 )); then
-                    # Can raise quality
                     local current_index=$(get_preset_index "$current_preset")
                     if (( current_index < ${#PRESET_ORDER[@]} - 1 )); then
                         local new_preset="${PRESET_ORDER[$((current_index + 1))]}"
                         echo ""
                         echo -e "${GREEN}✓ Bandwidth stable! Upgrading from ${current_preset} to ${new_preset}${NC}"
-                        
-                        # Kill current stream
+
                         kill $ffmpeg_pid 2>/dev/null
                         wait $ffmpeg_pid 2>/dev/null
-                        
+
                         current_preset=$new_preset
                         consecutive_high=0
                         sleep 2
-                        break  # Restart with new quality
+                        break
                     else
                         echo -e "${GREEN}  Already at highest quality${NC}"
                         consecutive_high=0
@@ -598,15 +797,14 @@ esac
 
 # Handle adaptive mode (default)
 if [[ "$QUALITY" == "adaptive" || "$QUALITY" == "auto" ]]; then
-    # Auto-detect camera
+    # In adaptive mode, camera is controlled by stream config from admin page
+    # Auto-detect is only used as fallback when no config exists
     CAMERA_IP=$(detect_camera)
     if [[ -z "$CAMERA_IP" ]]; then
-        echo -e "${RED}✗ No camera reachable${NC}"
-        echo "  Tried: $PRIMARY_CAMERA (primary)"
-        echo "  Tried: $FALLBACK_CAMERA (fallback)"
-        exit 1
+        echo -e "${YELLOW}Note: No local camera reachable (stream config will determine source)${NC}"
+        CAMERA_IP="$PRIMARY_CAMERA"
     fi
-    echo -e "${GREEN}Using camera: $CAMERA_IP${NC}"
+    echo -e "${GREEN}Default camera: $CAMERA_IP (may be overridden by stream config)${NC}"
     echo ""
     adaptive_stream
     exit 0
@@ -627,27 +825,45 @@ echo -e "${BOLD}Quality Preset:${NC} ${CYAN}$QUALITY${NC}"
 echo -e "${BOLD}Description:${NC}    $DESC"
 echo ""
 
-# Auto-detect camera if not specified
-CAMERA_IP=$(detect_camera)
-if [[ -z "$CAMERA_IP" ]]; then
-    echo -e "${RED}✗ No camera reachable${NC}"
-    echo "  Tried: $PRIMARY_CAMERA (primary)"
-    echo "  Tried: $FALLBACK_CAMERA (fallback)"
-    echo ""
-    echo "  Specify camera IP manually:"
-    echo "  $0 $QUALITY 192.168.0.XXX"
-    exit 1
+# Determine camera source: command-line arg > stream config > auto-detect
+if [[ -n "$CAMERA_IP" ]]; then
+    echo -e "${GREEN}Using camera from command line: $CAMERA_IP${NC}"
+    RTSP_URL="rtsp://${CAMERA_USER}:${CAMERA_PASS}@${CAMERA_IP}:554/${STREAM_PATH}"
+else
+    # Check stream config from admin page
+    FIXED_STREAM_CONFIG=$(fetch_stream_config)
+    FIXED_STREAM_CAMERA=$(echo "$FIXED_STREAM_CONFIG" | cut -d'|' -f2)
+    FIXED_STREAM_MODE=$(echo "$FIXED_STREAM_CONFIG" | cut -d'|' -f1)
+
+    if [[ "$FIXED_STREAM_MODE" == "split" ]]; then
+        echo -e "${YELLOW}Warning: Split view is only supported in adaptive mode${NC}"
+        echo -e "${YELLOW}Use '$0' (adaptive) for split view. Falling back to single camera.${NC}"
+    fi
+
+    if [[ -n "$FIXED_STREAM_CAMERA" ]]; then
+        echo -e "${GREEN}Using camera from stream config: $FIXED_STREAM_CAMERA${NC}"
+        RTSP_URL=$(get_camera_rtsp_url "$FIXED_STREAM_CAMERA" "$STREAM_PATH")
+    else
+        CAMERA_IP=$(detect_camera)
+        if [[ -z "$CAMERA_IP" ]]; then
+            echo -e "${RED}✗ No camera reachable${NC}"
+            echo "  Tried: $PRIMARY_CAMERA (primary)"
+            echo "  Tried: $FALLBACK_CAMERA (fallback)"
+            echo ""
+            echo "  Specify camera IP manually:"
+            echo "  $0 $QUALITY 192.168.0.XXX"
+            exit 1
+        fi
+        echo -e "${GREEN}Using camera (auto-detected): $CAMERA_IP${NC}"
+        RTSP_URL="rtsp://${CAMERA_USER}:${CAMERA_PASS}@${CAMERA_IP}:554/${STREAM_PATH}"
+    fi
 fi
-echo -e "${GREEN}Using camera: $CAMERA_IP${NC}"
 
 # Check if ffmpeg is installed
 if ! command -v ffmpeg &> /dev/null; then
     echo -e "${RED}✗ ffmpeg not found${NC}"
     exit 1
 fi
-
-# Build RTSP URL
-RTSP_URL="rtsp://${CAMERA_USER}:${CAMERA_PASS}@${CAMERA_IP}:554/${STREAM_PATH}"
 
 echo ""
 echo -e "${BOLD}Stream Configuration:${NC}"
