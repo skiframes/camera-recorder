@@ -286,11 +286,11 @@ detect_camera() {
 # Arrays to store preset info for adaptive mode
 declare -A PRESET_BITRATE
 PRESET_BITRATE[low]=400
-PRESET_BITRATE[medium]=1200
+PRESET_BITRATE[medium]=1800
 PRESET_BITRATE[high]=3500
 PRESET_BITRATE[ultra]=7000
 
-PRESET_ORDER=("low" "medium" "high")
+PRESET_ORDER=("low" "medium")  # Cap at medium for weak 5G; add "high" back when on WiFi/wired
 
 set_quality_preset() {
     case "$1" in
@@ -312,21 +312,21 @@ set_quality_preset() {
             DESC="Low (sub-stream, 400kbps, 10fps) - For poor connectivity"
             ;;
         medium)
-            # Balanced quality / bandwidth
-            # ~1.5 Mbps total, good for stable LTE
+            # Balanced quality / bandwidth — current max for 5G streaming
+            # ~2.2 Mbps total, resilient on marginal cellular
             STREAM_PATH="h264Preview_01_main"
-            VIDEO_BITRATE="1200k"
-            MAX_BITRATE="1500k"
-            BUFFER_SIZE="3000k"
-            FRAME_RATE="15"
-            KEYINT="30"
+            VIDEO_BITRATE="1800k"
+            MAX_BITRATE="2200k"
+            BUFFER_SIZE="4400k"
+            FRAME_RATE="20"
+            KEYINT="40"
             PROFILE="main"
             LEVEL="3.1"
             PRESET="fast"
             SCALE="-vf scale=1280:720"
             AUDIO_BITRATE="96k"
-            TOTAL_BITRATE_KBPS=1500
-            DESC="Medium (720p, 1.2Mbps, 15fps) - Balanced quality"
+            TOTAL_BITRATE_KBPS=2200
+            DESC="Medium (720p, 1.8Mbps, 20fps) - Balanced for 5G"
             ;;
         high)
             # High quality
@@ -535,11 +535,9 @@ adaptive_stream() {
         echo -e "${YELLOW}Running initial bandwidth test to determine starting quality...${NC}"
         local initial_speed=$(run_bandwidth_test 2000000 true)
 
-        # Determine starting quality
+        # Determine starting quality (capped at medium for 5G)
         local current_preset="medium"
-        if (( initial_speed >= 6000 )); then
-            current_preset="high"
-        elif (( initial_speed >= 2500 )); then
+        if (( initial_speed >= 2500 )); then
             current_preset="medium"
         else
             current_preset="low"
