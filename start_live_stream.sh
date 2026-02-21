@@ -542,18 +542,25 @@ adaptive_stream() {
                 echo -e "  Right: ${split_right_camera} → ${right_url%%@*}@..."
                 echo -e "  Filter: ${filter:0:80}..."
 
+                # Use UDP transport to avoid TCP interleaving CSeq errors
+                # with dual 4K Reolink streams. Buffer sizes increased for 4K.
+                # Each input gets large reorder queue and socket buffers.
                 ffmpeg \
-                    -rtsp_transport tcp \
-                    -analyzeduration 10000000 -probesize 32M -max_delay 5000000 \
-                    -err_detect ignore_err \
+                    -rtsp_transport udp \
+                    -buffer_size 4194304 \
+                    -max_delay 5000000 \
+                    -reorder_queue_size 4096 \
+                    -analyzeduration 10000000 -probesize 32M \
                     -fflags +genpts+igndts+discardcorrupt \
-                    -use_wallclock_as_timestamps 1 \
+                    -err_detect ignore_err \
                     -i "$left_url" \
-                    -rtsp_transport tcp \
-                    -analyzeduration 10000000 -probesize 32M -max_delay 5000000 \
-                    -err_detect ignore_err \
+                    -rtsp_transport udp \
+                    -buffer_size 4194304 \
+                    -max_delay 5000000 \
+                    -reorder_queue_size 4096 \
+                    -analyzeduration 10000000 -probesize 32M \
                     -fflags +genpts+igndts+discardcorrupt \
-                    -use_wallclock_as_timestamps 1 \
+                    -err_detect ignore_err \
                     -i "$right_url" \
                     -f lavfi -i anullsrc=channel_layout=mono:sample_rate=48000 \
                     -filter_complex "$filter" \
@@ -567,8 +574,8 @@ adaptive_stream() {
                     -r $FRAME_RATE \
                     -c:a aac -b:a $AUDIO_BITRATE \
                     -shortest \
-                    -f flv \
                     -progress /tmp/ffmpeg_progress_$$.log \
+                    -f flv \
                     "$RTMP_URL" 2>&1 &
             else
                 # SINGLE CAMERA
