@@ -30,8 +30,8 @@ if [[ -z "$CAMERA_USER" || -z "$CAMERA_PASS" || -z "$RTMP_URL" ]]; then
 fi
 
 # Camera settings - from config or defaults
-PRIMARY_CAMERA="${PRIMARY_CAMERA:-192.168.0.101}"
-FALLBACK_CAMERA="${FALLBACK_CAMERA:-192.168.0.103}"
+PRIMARY_CAMERA="${PRIMARY_CAMERA:-192.168.1.101}"
+FALLBACK_CAMERA="${FALLBACK_CAMERA:-192.168.1.103}"
 CAMERA_IP="${2:-}"  # Will be auto-detected if not provided
 
 # Quality preset (default: adaptive)
@@ -122,16 +122,16 @@ get_camera_rtsp_url() {
 
     case "$camera_name" in
         axis|Axis)
-            echo "rtsp://${AXIS_USER:-$CAMERA_USER}:${AXIS_PASS:-$CAMERA_PASS}@192.168.0.100/axis-media/media.amp?profile=h264-60fps"
+            echo "rtsp://${AXIS_USER:-$CAMERA_USER}:${AXIS_PASS:-$CAMERA_PASS}@192.168.1.100/axis-media/media.amp?profile=h264-60fps"
             ;;
         R1)
-            echo "rtsp://${CAMERA_USER}:${CAMERA_PASS}@192.168.0.101:554/${stream_path}"
+            echo "rtsp://${CAMERA_USER}:${CAMERA_PASS}@192.168.1.101:554/${stream_path}"
             ;;
         R2)
-            echo "rtsp://${CAMERA_USER}:${CAMERA_PASS}@192.168.0.102:554/${stream_path}"
+            echo "rtsp://${CAMERA_USER}:${CAMERA_PASS}@192.168.1.102:554/${stream_path}"
             ;;
         R3)
-            echo "rtsp://${CAMERA_USER}:${CAMERA_PASS}@192.168.0.103:554/${stream_path}"
+            echo "rtsp://${CAMERA_USER}:${CAMERA_PASS}@192.168.1.103:554/${stream_path}"
             ;;
         *)
             # Treat as raw IP for backward compatibility
@@ -758,7 +758,7 @@ show_help() {
     echo "  $0                      # Adaptive quality (default)"
     echo "  $0 high                 # Fixed high quality"
     echo "  $0 test                 # Test your upload speed"
-    echo "  $0 medium 192.168.0.104 # Specific camera"
+    echo "  $0 medium 192.168.1.104 # Specific camera"
     echo ""
     echo -e "${BOLD}Bandwidth Requirements:${NC}"
     echo "  low:         ~0.5 Mbps upload"
@@ -851,7 +851,7 @@ else
             echo "  Tried: $FALLBACK_CAMERA (fallback)"
             echo ""
             echo "  Specify camera IP manually:"
-            echo "  $0 $QUALITY 192.168.0.XXX"
+            echo "  $0 $QUALITY 192.168.1.XXX"
             exit 1
         fi
         echo -e "${GREEN}Using camera (auto-detected): $CAMERA_IP${NC}"
