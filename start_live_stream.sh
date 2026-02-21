@@ -68,6 +68,34 @@ NC='\033[0m'
 LOG_FILE="/tmp/flyingyankee_stream.log"
 
 # =============================================================================
+# PROCESS MANAGEMENT
+# =============================================================================
+
+# Robust ffmpeg kill: SIGTERM first, then SIGKILL if it doesn't die
+kill_ffmpeg() {
+    local pid=$1
+    if ! kill -0 $pid 2>/dev/null; then return 0; fi
+
+    # Graceful shutdown (SIGTERM)
+    kill $pid 2>/dev/null
+
+    # Wait up to 5 seconds for graceful exit
+    for i in $(seq 1 10); do
+        if ! kill -0 $pid 2>/dev/null; then
+            wait $pid 2>/dev/null
+            echo -e "${GREEN}ffmpeg (PID $pid) terminated gracefully${NC}"
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    # Force kill (SIGKILL - cannot be ignored)
+    echo -e "${RED}ffmpeg (PID $pid) didn't respond to SIGTERM, sending SIGKILL...${NC}"
+    kill -9 $pid 2>/dev/null
+    wait $pid 2>/dev/null
+}
+
+# =============================================================================
 # LIVE STATUS CHECK
 # =============================================================================
 
@@ -532,6 +560,10 @@ adaptive_stream() {
             # Set quality preset
             set_quality_preset "$current_preset"
 
+            # Kill any orphaned ffmpeg still targeting our RTMP URL
+            pkill -9 -f "flv.*${RTMP_URL}" 2>/dev/null
+            sleep 1
+
             if [[ "$stream_mode" == "split" ]]; then
                 # SPLIT VIEW: two RTSP inputs with filter_complex
                 local left_url=$(get_camera_rtsp_url "$split_left_camera" "$STREAM_PATH")
@@ -625,8 +657,7 @@ adaptive_stream() {
                     echo -e "${RED}⚠ Live streaming DISABLED on skiframes.com${NC}"
                     echo -e "${YELLOW}Stopping stream to save data...${NC}"
 
-                    kill $ffmpeg_pid 2>/dev/null
-                    wait $ffmpeg_pid 2>/dev/null
+                    kill_ffmpeg $ffmpeg_pid
 
                     live_disabled=true
                     break
@@ -639,8 +670,7 @@ adaptive_stream() {
                         echo ""
                         echo -e "${CYAN}⚡ Stream config changed! Restarting with new settings...${NC}"
 
-                        kill $ffmpeg_pid 2>/dev/null
-                        wait $ffmpeg_pid 2>/dev/null
+                        kill_ffmpeg $ffmpeg_pid
 
                         # Re-fetch config
                         stream_config=$(fetch_stream_config)
@@ -675,8 +705,7 @@ adaptive_stream() {
                                 echo ""
                                 echo -e "${RED}⚠ WATCHDOG: Frame output stalled at frame ${current_frame} for ${stall_count} checks${NC}"
                                 echo -e "${YELLOW}Restarting ffmpeg to recover...${NC}"
-                                kill $ffmpeg_pid 2>/dev/null
-                                wait $ffmpeg_pid 2>/dev/null
+                                kill_ffmpeg $ffmpeg_pid
                                 rm -f "$progress_file"
                                 stall_count=0
                                 last_frame_count=0
@@ -714,8 +743,7 @@ adaptive_stream() {
                         echo ""
                         echo -e "${RED}⚠ Bandwidth too low! Dropping from ${current_preset} to ${new_preset}${NC}"
 
-                        kill $ffmpeg_pid 2>/dev/null
-                        wait $ffmpeg_pid 2>/dev/null
+                        kill_ffmpeg $ffmpeg_pid
 
                         current_preset=$new_preset
                         consecutive_low=0
@@ -736,8 +764,7 @@ adaptive_stream() {
                         echo ""
                         echo -e "${GREEN}✓ Bandwidth stable! Upgrading from ${current_preset} to ${new_preset}${NC}"
 
-                        kill $ffmpeg_pid 2>/dev/null
-                        wait $ffmpeg_pid 2>/dev/null
+                        kill_ffmpeg $ffmpeg_pid
 
                         current_preset=$new_preset
                         consecutive_high=0
