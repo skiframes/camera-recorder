@@ -2,6 +2,7 @@
   "version": 1,
   "course_name": "Example GS Course",
   "camera": {
+    "type": "axis",
     "ip": "192.168.0.100",
     "stream_profile": "h264-60fps",
     "frame_width": 1920,

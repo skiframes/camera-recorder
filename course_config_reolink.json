@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "course_name": "Example GS Course (Reolink)",
+  "camera": {
+    "type": "reolink",
+    "ip": "192.168.0.101",
+    "stream_profile": "h264Preview_01_sub",
+    "frame_width": 1920,
+    "frame_height": 1080
+  },
+  "model": {
+    "path": "yolov8n.pt",
+    "confidence": 0.45,
+    "imgsz": 640
+  },
+  "gates": [
+    {
+      "id": 1,
+      "name": "Start",
+      "pan": 0,
+      "tilt": 0,
+      "zoom": 50,
+      "preset_id": 0,
+      "trigger_zone": {
+        "enabled": true,
+        "bbox_pct": [0.3, 0.2, 0.7, 0.8],
+        "direction": "exit"
+      },
+      "_comment": "For Reolink: pan value = preset_id (0-63)"
+    },
+    {
+      "id": 2,
+      "name": "Gate 2",
+      "pan": 1,
+      "tilt": 0,
+      "zoom": 45,
+      "preset_id": 1,
+      "trigger_zone": null
+    },
+    {
+      "id": 3,
+      "name": "Finish",
+      "pan": 2,
+      "tilt": 0,
+      "zoom": 40,
+      "preset_id": 2,
+      "trigger_zone": null
+    }
+  ],
+  "tracking": {
+    "gates_ahead": 2,
+    "zoom_margin": 1.2,
+    "pan_dead_zone_pct": 0.05,
+    "tilt_dead_zone_pct": 0.08,
+    "max_pan_speed": 70,
+    "max_tilt_speed": 40,
+    "ptz_update_hz": 15,
+    "smoothing_factor": 0.3,
+    "gate_advance_threshold_pct": 0.15,
+    "lost_racer_timeout_s": 3.0,
+    "anticipation_factor": 0.2,
+    "racer_frame_position": 0.4
+  },
+  "occlusion": {
+    "confirm_frames": 3,
+    "reacquire_window_s": 2.5,
+    "sam_reacquire_after_s": 1.5
+  },
+  "digital_stabilization": {
+    "enabled": true,
+    "overscan_pct": 0.15,
+    "smoothing_alpha": 0.25,
+    "racer_frame_position": 0.4
+  },
+  "output": {
+    "rtmp_url": null,
+    "record_path": null,
+    "debug_display": true
+  },
+  "_notes": {
+    "reolink_presets": "Reolink uses presets (0-63) instead of absolute pan/tilt. Set up presets using the Reolink app or calibrate_course.py, then use the preset ID as the 'pan' value for each gate.",
+    "stream_profiles": "h264Preview_01_main (4K), h264Preview_01_sub (lower res, less latency)"
+  }
+}

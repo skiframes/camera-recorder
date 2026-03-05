@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Auto-tracking system for ski racing using Axis PTZ camera + YOLO detection.
+Auto-tracking system for ski racing using PTZ camera + YOLO detection.
 Runs on J40 (Jetson Orin NX) with CUDA/TensorRT acceleration.
 
-Detects ski racers via YOLO, drives the Axis Q6135-LE PTZ camera to follow
-them down the course using VAPIX API, and applies digital stabilization
-for smooth output.
+Supports:
+  - Axis PTZ cameras (Q6135-LE, etc.) via VAPIX API
+  - Reolink PTZ cameras (RLC-823A, E1 Zoom, etc.) via HTTP JSON API
+
+Detects ski racers via YOLO, drives the PTZ camera to follow them down
+the course, and applies digital stabilization for smooth output.
 
 OCCLUSION HANDLING:
 -------------------
@@ -395,6 +398,259 @@ class AxisPTZController:
 
 
 # =============================================================================
+# REOLINK PTZ CONTROLLER
+# =============================================================================
+
+class ReolinkPTZController:
+    """
+    Controls Reolink PTZ cameras via HTTP JSON API.
+    Supports RLC-823A, RLC-523WA, E1 Zoom, and similar models.
+
+    Note: Reolink doesn't support true absolute pan/tilt positioning.
+    Uses continuous movement commands and presets instead.
+    """
+
+    def __init__(self, ip, user, password, channel=0, timeout=2.0):
+        self.ip = ip
+        self.user = user
+        self.password = password
+        self.channel = channel
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.base_url = f"http://{ip}/cgi-bin/api.cgi"
+        self.token = None
+        self._last_pan_speed = 0
+        self._last_tilt_speed = 0
+
+    def _login(self):
+        """Authenticate and obtain session token"""
+        payload = [{
+            "cmd": "Login",
+            "action": 0,
+            "param": {
+                "User": {
+                    "userName": self.user,
+                    "password": self.password
+                }
+            }
+        }]
+        try:
+            r = self.session.post(
+                f"{self.base_url}?cmd=Login&token=null",
+                json=payload,
+                timeout=self.timeout
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data and len(data) > 0:
+                    token_info = data[0].get('value', {}).get('Token', {})
+                    self.token = token_info.get('name')
+                    if self.token:
+                        return True
+        except Exception as e:
+            print(f"Reolink login failed: {e}")
+        return False
+
+    def _api_call(self, cmd, params, action=0):
+        """Make authenticated API call"""
+        if not self.token:
+            if not self._login():
+                return None
+
+        payload = [{
+            "cmd": cmd,
+            "action": action,
+            "param": params
+        }]
+        try:
+            r = self.session.post(
+                f"{self.base_url}?cmd={cmd}&token={self.token}",
+                json=payload,
+                timeout=self.timeout
+            )
+            if r.status_code == 200:
+                return r.json()
+        except requests.exceptions.RequestException:
+            pass
+        return None
+
+    def test_connection(self):
+        """Verify camera is reachable and credentials work"""
+        if self._login():
+            print(f"Reolink PTZ connected: {self.ip}")
+            return True
+        print(f"Reolink PTZ connection failed: {self.ip}")
+        return False
+
+    def get_position(self):
+        """
+        Query current PTZ state.
+        Note: Reolink doesn't provide absolute pan/tilt values.
+        Returns zoom position if available.
+        """
+        result = self._api_call("GetZoomFocus", {"channel": self.channel})
+        if result and len(result) > 0:
+            zf = result[0].get('value', {}).get('ZoomFocus', {})
+            return {
+                'pan': 0,  # Reolink doesn't report absolute pan
+                'tilt': 0,  # Reolink doesn't report absolute tilt
+                'zoom': zf.get('zoom', {}).get('pos', 0)
+            }
+        return {'pan': 0, 'tilt': 0, 'zoom': 0}
+
+    def move_continuous(self, pan_speed, tilt_speed):
+        """
+        Set continuous pan/tilt movement.
+        pan_speed: -100 to 100 (negative=left, positive=right)
+        tilt_speed: -100 to 100 (negative=down, positive=up)
+        """
+        # Convert from -100..100 range to Reolink 0..64 speed + direction
+        reolink_speed = max(abs(pan_speed), abs(tilt_speed))
+        reolink_speed = int(reolink_speed * 64 / 100)
+        reolink_speed = max(1, min(64, reolink_speed))
+
+        # Determine operation based on direction
+        if pan_speed == 0 and tilt_speed == 0:
+            op = "Stop"
+        elif abs(pan_speed) > abs(tilt_speed):
+            # Primarily horizontal movement
+            op = "Right" if pan_speed > 0 else "Left"
+        else:
+            # Primarily vertical movement
+            op = "Up" if tilt_speed > 0 else "Down"
+
+        # Diagonal movements
+        if abs(pan_speed) > 10 and abs(tilt_speed) > 10:
+            if pan_speed > 0 and tilt_speed > 0:
+                op = "RightUp"
+            elif pan_speed > 0 and tilt_speed < 0:
+                op = "RightDown"
+            elif pan_speed < 0 and tilt_speed > 0:
+                op = "LeftUp"
+            else:
+                op = "LeftDown"
+
+        params = {
+            "channel": self.channel,
+            "op": op
+        }
+        if op != "Stop":
+            params["speed"] = reolink_speed
+
+        self._api_call("PtzCtrl", params)
+        self._last_pan_speed = pan_speed
+        self._last_tilt_speed = tilt_speed
+
+    def move_absolute(self, pan, tilt, zoom, speed=50):
+        """
+        Move to preset position.
+        Note: Reolink doesn't support true absolute positioning.
+        The pan/tilt values are interpreted as preset IDs (0-63).
+        Use calibrate_course.py to set up presets for each gate.
+        """
+        # For Reolink, we use the 'pan' value as preset ID
+        preset_id = int(pan) % 64  # Reolink supports presets 0-63
+
+        reolink_speed = int(speed * 64 / 100)
+        reolink_speed = max(1, min(64, reolink_speed))
+
+        params = {
+            "channel": self.channel,
+            "op": "ToPos",
+            "id": preset_id,
+            "speed": reolink_speed
+        }
+        self._api_call("PtzCtrl", params)
+
+        # Also set zoom if specified
+        if zoom > 0:
+            self.set_zoom(zoom)
+
+    def set_zoom(self, zoom):
+        """Set absolute zoom position (0-100 or camera-specific range)"""
+        params = {
+            "ZoomFocus": {
+                "channel": self.channel,
+                "op": "ZoomPos",
+                "pos": int(zoom)
+            }
+        }
+        self._api_call("StartZoomFocus", params)
+
+    def relative_zoom(self, amount):
+        """Relative zoom: positive = zoom in, negative = zoom out"""
+        op = "ZoomInc" if amount > 0 else "ZoomDec"
+        params = {
+            "channel": self.channel,
+            "op": op,
+            "speed": min(64, abs(int(amount)))
+        }
+        self._api_call("PtzCtrl", params)
+
+    def stop(self):
+        """Stop all PTZ movement"""
+        params = {
+            "channel": self.channel,
+            "op": "Stop"
+        }
+        self._api_call("PtzCtrl", params)
+
+    def go_to_preset(self, preset_id, speed=32):
+        """Move to a specific preset position"""
+        params = {
+            "channel": self.channel,
+            "op": "ToPos",
+            "id": int(preset_id),
+            "speed": int(speed)
+        }
+        self._api_call("PtzCtrl", params)
+
+    def save_preset(self, preset_id, name=None):
+        """Save current position as preset"""
+        params = {
+            "channel": self.channel,
+            "op": "AddPreset",
+            "id": int(preset_id),
+            "name": name or f"Preset_{preset_id}"
+        }
+        return self._api_call("PtzCtrl", params)
+
+    def get_presets(self):
+        """Get list of saved presets"""
+        result = self._api_call("GetPtzPreset", {"channel": self.channel})
+        if result and len(result) > 0:
+            return result[0].get('value', {}).get('PtzPreset', [])
+        return []
+
+
+# =============================================================================
+# PTZ CONTROLLER FACTORY
+# =============================================================================
+
+def create_ptz_controller(camera_type, ip, user, password, **kwargs):
+    """
+    Factory function to create the appropriate PTZ controller.
+
+    Args:
+        camera_type: "axis" or "reolink"
+        ip: Camera IP address
+        user: Username
+        password: Password
+        **kwargs: Additional controller-specific arguments
+
+    Returns:
+        PTZ controller instance
+    """
+    camera_type = camera_type.lower()
+    if camera_type == "axis":
+        return AxisPTZController(ip, user, password, **kwargs)
+    elif camera_type == "reolink":
+        return ReolinkPTZController(ip, user, password, **kwargs)
+    else:
+        raise ValueError(f"Unknown camera type: {camera_type}. Use 'axis' or 'reolink'.")
+
+
+# =============================================================================
 # YOLO DETECTOR
 # =============================================================================
 
@@ -750,11 +1006,23 @@ class RacerTracker:
 
         # Load credentials
         creds = load_credentials()
-        self.axis_user = creds.get('AXIS_USER', 'root')
-        self.axis_pass = creds.get('AXIS_PASS', '')
 
-        # Initialize components
-        self.ptz = AxisPTZController(self.camera_ip, self.axis_user, self.axis_pass)
+        # Determine camera type and credentials
+        self.camera_type = cam_cfg.get('type', 'axis').lower()
+        if self.camera_type == 'reolink':
+            ptz_user = creds.get('REOLINK_USER', creds.get('CAMERA_USER', 'admin'))
+            ptz_pass = creds.get('REOLINK_PASS', creds.get('CAMERA_PASS', ''))
+        else:
+            ptz_user = creds.get('AXIS_USER', 'root')
+            ptz_pass = creds.get('AXIS_PASS', '')
+
+        # Initialize PTZ controller based on camera type
+        self.ptz = create_ptz_controller(
+            self.camera_type,
+            self.camera_ip,
+            ptz_user,
+            ptz_pass
+        )
         self.course = CourseMap(self.config)
         self.detector = None  # lazy init (YOLO is heavy)
 
@@ -819,9 +1087,24 @@ class RacerTracker:
             url = self.source
             print(f"Opening video file: {url}")
         else:
-            profile = self.config.get('camera', {}).get('stream_profile', 'h264-60fps')
-            url = f"rtsp://{self.axis_user}:{self.axis_pass}@{self.camera_ip}/axis-media/media.amp?profile={profile}"
-            print(f"Connecting to RTSP: {self.camera_ip}")
+            cam_cfg = self.config.get('camera', {})
+            creds = load_credentials()
+
+            if self.camera_type == 'reolink':
+                # Reolink RTSP URL format
+                user = creds.get('REOLINK_USER', creds.get('CAMERA_USER', 'admin'))
+                passwd = creds.get('REOLINK_PASS', creds.get('CAMERA_PASS', ''))
+                # Use sub-stream for tracking (lower latency), main for recording
+                stream = cam_cfg.get('stream_profile', 'h264Preview_01_sub')
+                url = f"rtsp://{user}:{passwd}@{self.camera_ip}:554/{stream}"
+            else:
+                # Axis RTSP URL format
+                user = creds.get('AXIS_USER', 'root')
+                passwd = creds.get('AXIS_PASS', '')
+                profile = cam_cfg.get('stream_profile', 'h264-60fps')
+                url = f"rtsp://{user}:{passwd}@{self.camera_ip}/axis-media/media.amp?profile={profile}"
+
+            print(f"Connecting to {self.camera_type.upper()} RTSP: {self.camera_ip}")
 
         self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)

@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
 Interactive calibration tool for mapping ski course gate positions.
-Connects to the Axis PTZ camera, lets you jog to each gate, and records
-the (pan, tilt, zoom) waypoints into course_config.json.
+Connects to the PTZ camera (Axis or Reolink), lets you jog to each gate,
+and records the waypoints into course_config.json.
+
+Supports:
+  - Axis PTZ cameras: records absolute pan/tilt/zoom positions
+  - Reolink PTZ cameras: saves positions as presets (0-63)
 
 Usage:
     python3 calibrate_course.py --camera 192.168.0.100
+    python3 calibrate_course.py --camera 192.168.0.100 --type reolink
     python3 calibrate_course.py --camera 192.168.0.100 --validate course_config.json
     python3 calibrate_course.py --camera 192.168.0.100 --output my_course.json
 
@@ -33,7 +38,7 @@ import argparse
 
 # Add parent dir so we can import from auto_tracker
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from auto_tracker import AxisPTZController, load_credentials
+from auto_tracker import AxisPTZController, ReolinkPTZController, create_ptz_controller, load_credentials
 
 # Movement speed presets
 SPEED_PRESETS = [10, 25, 50, 75, 100]
@@ -46,17 +51,22 @@ ZOOM_STEP = 200
 
 
 class CourseCalibrator:
-    def __init__(self, camera_ip, user, password):
-        self.ptz = AxisPTZController(camera_ip, user, password, timeout=1.0)
+    def __init__(self, camera_ip, user, password, camera_type='axis'):
+        self.camera_type = camera_type.lower()
+        self.ptz = create_ptz_controller(self.camera_type, camera_ip, user, password)
         self.gates = []
         self.speed_index = DEFAULT_SPEED_INDEX
         self.camera_ip = camera_ip
         self.user = user
         self.password = password
+        self.next_preset_id = 0  # For Reolink preset assignment
 
-        # RTSP stream for preview
-        profile = "h264-60fps"
-        self.rtsp_url = f"rtsp://{user}:{password}@{camera_ip}/axis-media/media.amp?profile={profile}"
+        # RTSP stream for preview (different URL format per camera type)
+        if self.camera_type == 'reolink':
+            self.rtsp_url = f"rtsp://{user}:{password}@{camera_ip}:554/h264Preview_01_sub"
+        else:
+            profile = "h264-60fps"
+            self.rtsp_url = f"rtsp://{user}:{password}@{camera_ip}/axis-media/media.amp?profile={profile}"
 
     def connect_preview(self):
         """Connect to RTSP stream for live preview"""
@@ -113,16 +123,39 @@ class CourseCalibrator:
             return
 
         gate_id = len(self.gates) + 1
-        gate = {
-            'id': gate_id,
-            'name': f'Gate {gate_id}',
-            'pan': round(pos['pan'], 1),
-            'tilt': round(pos['tilt'], 1),
-            'zoom': pos['zoom'],
-            'trigger_zone': None
-        }
+
+        if self.camera_type == 'reolink':
+            # Reolink: save current position as a preset
+            preset_id = self.next_preset_id
+            preset_name = f"Gate_{gate_id}"
+            result = self.ptz.save_preset(preset_id, preset_name)
+            if result:
+                print(f"  Saved Reolink preset {preset_id}: {preset_name}")
+            self.next_preset_id += 1
+
+            gate = {
+                'id': gate_id,
+                'name': f'Gate {gate_id}',
+                'pan': preset_id,  # For Reolink, pan = preset ID
+                'tilt': 0,
+                'zoom': pos.get('zoom', 50),
+                'preset_id': preset_id,
+                'trigger_zone': None
+            }
+            print(f"  GATE #{gate_id} recorded: preset_id={preset_id} zoom={gate['zoom']}")
+        else:
+            # Axis: record absolute pan/tilt/zoom
+            gate = {
+                'id': gate_id,
+                'name': f'Gate {gate_id}',
+                'pan': round(pos['pan'], 1),
+                'tilt': round(pos['tilt'], 1),
+                'zoom': pos['zoom'],
+                'trigger_zone': None
+            }
+            print(f"  GATE #{gate_id} recorded: pan={gate['pan']} tilt={gate['tilt']} zoom={gate['zoom']}")
+
         self.gates.append(gate)
-        print(f"  GATE #{gate_id} recorded: pan={gate['pan']} tilt={gate['tilt']} zoom={gate['zoom']}")
 
     def mark_start(self):
         """Mark last gate as start trigger"""
@@ -217,17 +250,24 @@ class CourseCalibrator:
 
     def save_config(self, output_path):
         """Save course configuration to JSON file"""
+        # Set appropriate stream profile for camera type
+        if self.camera_type == 'reolink':
+            stream_profile = 'h264Preview_01_sub'
+        else:
+            stream_profile = 'h264-60fps'
+
         config = {
             'version': 1,
             'course_name': 'Unnamed Course',
             'camera': {
+                'type': self.camera_type,
                 'ip': self.camera_ip,
-                'stream_profile': 'h264-60fps',
+                'stream_profile': stream_profile,
                 'frame_width': 1920,
                 'frame_height': 1080
             },
             'model': {
-                'path': 'yolov8n.engine',
+                'path': 'yolov8n.pt',
                 'confidence': 0.45,
                 'imgsz': 640
             },
@@ -429,19 +469,25 @@ class CourseCalibrator:
 def main():
     parser = argparse.ArgumentParser(description="Course calibration tool for auto-tracker")
     parser.add_argument("--camera", type=str, default="192.168.0.100",
-                        help="Axis camera IP address")
+                        help="Camera IP address")
+    parser.add_argument("--type", type=str, default="axis", choices=["axis", "reolink"],
+                        help="Camera type: axis or reolink (default: axis)")
     parser.add_argument("--output", type=str, default="course_config.json",
                         help="Output config file path")
     parser.add_argument("--validate", type=str, default=None,
                         help="Validate an existing config file")
     args = parser.parse_args()
 
-    # Load credentials
+    # Load credentials based on camera type
     creds = load_credentials()
-    user = creds.get('AXIS_USER', 'root')
-    password = creds.get('AXIS_PASS', '')
+    if args.type.lower() == 'reolink':
+        user = creds.get('REOLINK_USER', creds.get('CAMERA_USER', 'admin'))
+        password = creds.get('REOLINK_PASS', creds.get('CAMERA_PASS', ''))
+    else:
+        user = creds.get('AXIS_USER', 'root')
+        password = creds.get('AXIS_PASS', '')
 
-    calibrator = CourseCalibrator(args.camera, user, password)
+    calibrator = CourseCalibrator(args.camera, user, password, camera_type=args.type)
 
     if args.validate:
         calibrator.validate_config(args.validate)
