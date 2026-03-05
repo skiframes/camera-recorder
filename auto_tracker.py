@@ -991,6 +991,11 @@ class RacerTracker:
         self.tilt_dead_zone = track_cfg.get('tilt_dead_zone_pct', 0.08)
         self.max_pan_speed = track_cfg.get('max_pan_speed', 70)
         self.max_tilt_speed = track_cfg.get('max_tilt_speed', 40)
+        # Gain controls how aggressively camera responds to error
+        # Lower = smoother/slower response, Higher = more aggressive
+        # Default 1.0 means max speed at 70% error from center
+        self.pan_gain = track_cfg.get('pan_gain', 1.0)
+        self.tilt_gain = track_cfg.get('tilt_gain', 1.0)
         self.anticipation = track_cfg.get('anticipation_factor', 0.2)
         self.gate_advance_pct = track_cfg.get('gate_advance_threshold_pct', 0.15)
         self.lost_timeout = track_cfg.get('lost_racer_timeout_s', 3.0)
@@ -1282,13 +1287,15 @@ class RacerTracker:
             norm_error_x -= self.anticipation
 
         # Proportional control -> speed commands
-        gain_pan = self.max_pan_speed / 0.7
-        gain_tilt = self.max_tilt_speed / 0.7
+        # Base gain: max speed reached at 70% error from center
+        # Multiply by configurable gain for tuning (lower = smoother)
+        base_gain_pan = self.max_pan_speed / 0.7
+        base_gain_tilt = self.max_tilt_speed / 0.7
 
         pan_speed = int(max(-self.max_pan_speed,
-                           min(self.max_pan_speed, norm_error_x * gain_pan)))
+                           min(self.max_pan_speed, norm_error_x * base_gain_pan * self.pan_gain)))
         tilt_speed = int(max(-self.max_tilt_speed,
-                            min(self.max_tilt_speed, norm_error_y * gain_tilt)))
+                            min(self.max_tilt_speed, norm_error_y * base_gain_tilt * self.tilt_gain)))
 
         return pan_speed, tilt_speed, pan_direction
 

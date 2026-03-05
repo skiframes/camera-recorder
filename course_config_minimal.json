@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "course_name": "Minimal Track Setup",
+  "camera": {
+    "type": "reolink",
+    "ip": "192.168.0.101",
+    "stream_profile": "h264Preview_01_sub",
+    "frame_width": 1920,
+    "frame_height": 1080
+  },
+  "model": {
+    "path": "yolov8n.pt",
+    "confidence": 0.40,
+    "imgsz": 640
+  },
+  "gates": [
+    {
+      "id": 1,
+      "name": "Start",
+      "pan": 0,
+      "tilt": 0,
+      "zoom": 50,
+      "trigger_zone": {
+        "enabled": true,
+        "bbox_pct": [0.2, 0.1, 0.8, 0.9],
+        "direction": "exit"
+      },
+      "_comment": "Camera waits here. Tracking starts when person exits trigger zone."
+    },
+    {
+      "id": 2,
+      "name": "Finish",
+      "pan": 0,
+      "tilt": 0,
+      "zoom": 50,
+      "trigger_zone": null,
+      "_comment": "Optional. Just marks end of run. Can be same position as start."
+    }
+  ],
+  "tracking": {
+    "pan_dead_zone_pct": 0.08,
+    "tilt_dead_zone_pct": 0.10,
+    "max_pan_speed": 50,
+    "max_tilt_speed": 30,
+    "pan_gain": 0.5,
+    "tilt_gain": 0.5,
+    "ptz_update_hz": 15,
+    "lost_racer_timeout_s": 5.0,
+    "racer_frame_position": 0.5,
+    "anticipation_factor": 0.0,
+    "_comment_gains": "Lower gain (0.3-0.7) = smoother/slower pan. Higher (1.0+) = more aggressive."
+  },
+  "occlusion": {
+    "confirm_frames": 3,
+    "reacquire_window_s": 2.5
+  },
+  "digital_stabilization": {
+    "enabled": false
+  }
+}
