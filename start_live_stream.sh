@@ -169,13 +169,13 @@ get_camera_rtsp_url() {
 }
 
 # Fetch and parse stream config from S3 using Python3
-# Returns: mode|camera|left_camera|left_crop|left_label|right_camera|right_crop|right_label
+# Returns: mode|camera|left_camera|left_crop|left_label|right_camera|right_crop|right_label|pip_camera|pip_position|pip_size
 fetch_stream_config() {
     local config
     config=$(curl -s --max-time 10 "${STREAM_CONFIG_URL}?t=$(date +%s)" 2>/dev/null)
 
     if [[ -z "$config" || "$config" == *"NoSuchKey"* || "$config" == *"AccessDenied"* ]]; then
-        echo "single|R1||||||"
+        echo "single|R1|||||||||"
         return
     fi
 
@@ -188,10 +188,11 @@ try:
     s = c.get('split') or {}
     l = s.get('left') or {}
     r = s.get('right') or {}
-    print(f\"{m}|{cam}|{l.get('camera','')}|{l.get('crop','')}|{l.get('label','')}|{r.get('camera','')}|{r.get('crop','')}|{r.get('label','')}\")
+    p = c.get('pip') or {}
+    print(f\"{m}|{cam}|{l.get('camera','')}|{l.get('crop','')}|{l.get('label','')}|{r.get('camera','')}|{r.get('crop','')}|{r.get('label','')}|{p.get('camera','')}|{p.get('position','bottom-right')}|{p.get('size',25)}\")
 except:
-    print('single|R1||||||')
-" 2>/dev/null || echo "single|R1||||||"
+    print('single|R1|||||||||')
+" 2>/dev/null || echo "single|R1|||||||||"
 }
 
 # Check if stream config has changed (returns 0 if changed)
@@ -244,6 +245,49 @@ build_split_filter() {
     else
         filter+=";[combined]null[out]"
     fi
+
+    echo "$filter"
+}
+
+# Build ffmpeg filter_complex for PIP view
+# Args: pip_position pip_size
+# pip_position: top-left, top-right, bottom-left, bottom-right
+# pip_size: 25, 33, or 50 (percentage of output width)
+build_pip_filter() {
+    local pip_position=$1
+    local pip_size=$2
+
+    # Output is 1920x1080, PIP size as percentage
+    local pip_width=$((1920 * pip_size / 100))
+    local pip_height=$((1080 * pip_size / 100))
+    local margin=20
+
+    # Calculate overlay position
+    local x_pos y_pos
+    case "$pip_position" in
+        top-left)
+            x_pos="$margin"
+            y_pos="$margin"
+            ;;
+        top-right)
+            x_pos="$((1920 - pip_width - margin))"
+            y_pos="$margin"
+            ;;
+        bottom-left)
+            x_pos="$margin"
+            y_pos="$((1080 - pip_height - margin))"
+            ;;
+        bottom-right|*)
+            x_pos="$((1920 - pip_width - margin))"
+            y_pos="$((1080 - pip_height - margin))"
+            ;;
+    esac
+
+    # Filter: scale main to 1920x1080, scale PIP to size, overlay
+    local filter=""
+    filter+="[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[main];"
+    filter+="[1:v]scale=${pip_width}:${pip_height}:force_original_aspect_ratio=decrease,pad=${pip_width}:${pip_height}:(ow-iw)/2:(oh-ih)/2,setsar=1[pip];"
+    filter+="[main][pip]overlay=${x_pos}:${y_pos}[out]"
 
     echo "$filter"
 }
@@ -517,11 +561,18 @@ adaptive_stream() {
         local split_right_camera=$(echo "$stream_config" | cut -d'|' -f6)
         local split_right_crop=$(echo "$stream_config" | cut -d'|' -f7)
         local split_right_label=$(echo "$stream_config" | cut -d'|' -f8)
+        local pip_camera=$(echo "$stream_config" | cut -d'|' -f9)
+        local pip_position=$(echo "$stream_config" | cut -d'|' -f10)
+        local pip_size=$(echo "$stream_config" | cut -d'|' -f11)
 
         if [[ "$stream_mode" == "split" ]]; then
             echo -e "${CYAN}Stream mode: SPLIT VIEW${NC}"
             echo -e "  Left:  ${split_left_camera} (crop: ${split_left_crop}) - ${split_left_label}"
             echo -e "  Right: ${split_right_camera} (crop: ${split_right_crop}) - ${split_right_label}"
+        elif [[ "$stream_mode" == "pip" ]]; then
+            echo -e "${CYAN}Stream mode: PIP VIEW${NC}"
+            echo -e "  Main: ${stream_camera}"
+            echo -e "  PIP:  ${pip_camera} (${pip_position}, ${pip_size}%)"
         else
             echo -e "${CYAN}Stream mode: SINGLE CAMERA - ${stream_camera}${NC}"
             # Override CAMERA_IP with configured camera
@@ -590,6 +641,46 @@ adaptive_stream() {
                     -use_wallclock_as_timestamps 1 \
                     -err_detect ignore_err \
                     -i "$right_url" \
+                    -f lavfi -i anullsrc=channel_layout=mono:sample_rate=48000 \
+                    -filter_complex "$filter" \
+                    -map "[out]" -map 2:a:0 \
+                    -c:v libx264 -preset $PRESET \
+                    -profile:v $PROFILE -level $LEVEL \
+                    -pix_fmt yuv420p \
+                    -x264-params "keyint=${KEYINT}:min-keyint=${KEYINT}" \
+                    -b:v $VIDEO_BITRATE -maxrate $MAX_BITRATE -bufsize $BUFFER_SIZE \
+                    -vsync cfr \
+                    -r $FRAME_RATE \
+                    -c:a aac -b:a $AUDIO_BITRATE \
+                    -shortest \
+                    -progress /tmp/ffmpeg_progress_$$.log \
+                    -f flv \
+                    "$RTMP_URL" 2>&1 &
+            elif [[ "$stream_mode" == "pip" ]]; then
+                # PIP VIEW: main camera with small overlay
+                local main_url=$(get_camera_rtsp_url "$stream_camera" "$STREAM_PATH")
+                local pip_url=$(get_camera_rtsp_url "$pip_camera" "$STREAM_PATH")
+                local filter=$(build_pip_filter "$pip_position" "$pip_size")
+
+                echo -e "  Main: ${stream_camera} → ${main_url%%@*}@..."
+                echo -e "  PIP:  ${pip_camera} → ${pip_url%%@*}@..."
+                echo -e "  Filter: ${filter:0:80}..."
+
+                ffmpeg \
+                    -rtsp_transport tcp \
+                    -thread_queue_size 512 \
+                    -analyzeduration 10000000 -probesize 32M \
+                    -fflags +genpts+igndts+discardcorrupt \
+                    -use_wallclock_as_timestamps 1 \
+                    -err_detect ignore_err \
+                    -i "$main_url" \
+                    -rtsp_transport tcp \
+                    -thread_queue_size 512 \
+                    -analyzeduration 10000000 -probesize 32M \
+                    -fflags +genpts+igndts+discardcorrupt \
+                    -use_wallclock_as_timestamps 1 \
+                    -err_detect ignore_err \
+                    -i "$pip_url" \
                     -f lavfi -i anullsrc=channel_layout=mono:sample_rate=48000 \
                     -filter_complex "$filter" \
                     -map "[out]" -map 2:a:0 \
@@ -680,9 +771,14 @@ adaptive_stream() {
                         split_right_camera=$(echo "$stream_config" | cut -d'|' -f6)
                         split_right_crop=$(echo "$stream_config" | cut -d'|' -f7)
                         split_right_label=$(echo "$stream_config" | cut -d'|' -f8)
+                        pip_camera=$(echo "$stream_config" | cut -d'|' -f9)
+                        pip_position=$(echo "$stream_config" | cut -d'|' -f10)
+                        pip_size=$(echo "$stream_config" | cut -d'|' -f11)
 
                         if [[ "$stream_mode" == "split" ]]; then
                             echo -e "  New: SPLIT ${split_left_camera} + ${split_right_camera}"
+                        elif [[ "$stream_mode" == "pip" ]]; then
+                            echo -e "  New: PIP ${stream_camera} + ${pip_camera} (${pip_position}, ${pip_size}%)"
                         else
                             echo -e "  New: SINGLE ${stream_camera}"
                         fi
