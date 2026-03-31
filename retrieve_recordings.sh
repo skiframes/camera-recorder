@@ -40,7 +40,7 @@ REMOTE_HOST="4t"
 REMOTE_BASE="/home/pa91/data/recordings"
 
 # Skip upload if set to 1
-SKIP_UPLOAD="${SKIP_UPLOAD:-0}"
+SKIP_UPLOAD="${SKIP_UPLOAD:-1}"
 
 # =============================================================================
 # Logging (defined early so upload-only mode can use them)
