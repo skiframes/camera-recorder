@@ -98,8 +98,8 @@ show_progress() {
   local filled=$(( pct * bar_width / 100 ))
   local empty=$(( bar_width - filled ))
   local bar=""
-  for ((i=0; i<filled; i++)); do bar+="█"; done
-  for ((i=0; i<empty; i++)); do bar+="░"; done
+  for ((_b=0; _b<filled; _b++)); do bar+="█"; done
+  for ((_b=0; _b<empty; _b++)); do bar+="░"; done
 
   local speed_str="--"
   local speed_bps=0
